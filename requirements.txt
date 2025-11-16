@@ -4,3 +4,6 @@ numpy
 plotly
 python-dateutil
 openpyxl
+os
+datetime
+zipfile
