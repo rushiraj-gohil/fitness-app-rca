@@ -2,212 +2,273 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import zipfile
-from datetime import timedelta
 import os
+from datetime import timedelta
 
-st.set_page_config(page_title="Fitness RCA Dashboard", layout="wide")
+st.set_page_config(page_title="Fitness App RCA", layout="wide")
 
-ZIP_PATH = "Dataset_problem.zip"   # <--- ZIP ALREADY IN REPO
-
-
-# ============================================================
-# 1) SAFE CSV LOADER (Fixes __MACOSX junk)
-# ============================================================
+# -----------------------------------------------------------
+# 1️⃣ LOAD DATA (NO UPLOAD REQUIRED)
+# -----------------------------------------------------------
 
 @st.cache_data
-def load_dataset(zip_path):
-    users = app_events = app_sessions = activity_data = subscriptions = None
+def load_data():
+    zip_path = "Dataset_problem.zip"
+    if not os.path.exists(zip_path):
+        st.error("❌ Dataset_problem.zip not found in the repository.")
+        st.stop()
 
-    with zipfile.ZipFile(zip_path, 'r') as z:
-        for filename in z.namelist():
-            if "__MACOSX" in filename or "._" in filename:
-                continue
-            if not filename.endswith(".csv"):
-                continue
+    valid_dfs = {}
+    with zipfile.ZipFile(zip_path, "r") as z:
+        for file in z.namelist():
+            if file.startswith("__MACOSX") or file.endswith(".DS_Store"):
+                continue  # skip mac ghost files
 
-            with z.open(filename) as f:
+            if file.lower().endswith(".csv"):
                 try:
-                    df = pd.read_csv(f)
-                except Exception:
-                    continue
+                    df = pd.read_csv(z.open(file))
+                    table_name = file.split("/")[-1].replace(".csv", "")
+                    valid_dfs[table_name] = df
+                except Exception as e:
+                    st.warning(f"⚠️ Failed to load {file}: {e}")
 
-            fname = filename.lower()
+    required = ["users", "app_events", "app_sessions", "activity_data", "subscriptions"]
+    for r in required:
+        if r not in valid_dfs:
+            st.error(f"❌ Missing required file: {r}.csv")
+            st.stop()
 
-            if "users" in fname:
-                users = df
-            elif "app_events" in fname:
-                app_events = df
-            elif "app_sessions" in fname:
-                app_sessions = df
-            elif "activity_data" in fname:
-                activity_data = df
-            elif "subscriptions" in fname:
-                subscriptions = df
-
-    return users, app_events, app_sessions, activity_data, subscriptions
+    return valid_dfs
 
 
-# ============================================================
-# 2) Activation bucket
-# ============================================================
+dfs = load_data()
+users = dfs["users"]
+app_events = dfs["app_events"]
+app_sessions = dfs["app_sessions"]
+activity_data = dfs["activity_data"]
+subscriptions = dfs["subscriptions"]
 
-def activation_label(row):
-    sd = pd.to_datetime(row["signup_date"], errors="coerce")
-    fo = pd.to_datetime(row["first_open_date"], errors="coerce")
-
-    if pd.isna(sd):
-        return "Unknown"
-    if pd.isna(fo):
-        return "Never Opened"
-
-    diff = (fo - sd).days
-
-    if diff == 0:
-        return "Day 0"
-    elif 1 <= diff <= 7:
-        return "1–7 Days"
-    elif 8 <= diff <= 30:
-        return "8–30 Days"
-    elif diff > 30:
-        return "30+ Days"
-    return "Unknown"
-
-
-# ============================================================
-# 3) Process dataset and compute metrics
-# ============================================================
+# -----------------------------------------------------------
+# 2️⃣ DATA PREPROCESSING + FEATURE ENGINEERING
+# -----------------------------------------------------------
 
 @st.cache_data
 def preprocess_and_compute(users, app_events, app_sessions, activity_data, subscriptions):
 
-    # Convert dates
-    users["signup_date"] = pd.to_datetime(users["created_at"], errors="coerce")
+    # Ensure datetime types
+    users["created_at"] = pd.to_datetime(users["created_at"], errors="coerce")
     app_events["event_time"] = pd.to_datetime(app_events["event_time"], errors="coerce")
     app_sessions["session_start"] = pd.to_datetime(app_sessions["session_start"], errors="coerce")
-    subscriptions["subscription_start_date"] = pd.to_datetime(subscriptions["subscription_start_date"], errors="coerce")
+    subscriptions["subscription_start_date"] = pd.to_datetime(
+        subscriptions["subscription_start_date"], errors="coerce"
+    )
 
-    # ---- First App Open ----
+    # ---- 90 DAY WINDOW ----
+    max_date = users["created_at"].max()
+    min_date = max_date - pd.Timedelta(days=90)
+
+    recent = users[(users["created_at"] >= min_date) & (users["created_at"] <= max_date)].copy()
+
+    # -----------------------------------------------------------
+    # FIRST OPEN
+    # -----------------------------------------------------------
     first_open = (
-        app_events[app_events.event_name == "app_open"]
+        app_events[app_events["event_name"] == "app_open"]
         .groupby("user_id")["event_time"]
         .min()
         .reset_index()
         .rename(columns={"event_time": "first_open_date"})
     )
 
-    # ---- Feature Depth ----
-    feature_names = ["view_sleep", "view_recovery", "view_strain", "view_coaching"]
+    # -----------------------------------------------------------
+    # FEATURE DEPTH
+    # -----------------------------------------------------------
+    feature_events = ["view_sleep", "view_recovery", "view_strain", "view_coaching"]
+
     feature_usage = (
-        app_events[app_events["event_name"].isin(feature_names)]
+        app_events[app_events["event_name"].isin(feature_events)]
         .groupby("user_id")["event_name"]
         .nunique()
         .reset_index()
         .rename(columns={"event_name": "feature_count"})
     )
 
-    # ---- Workout Frequency ----
+    # -----------------------------------------------------------
+    # WORKOUT FREQUENCY
+    # -----------------------------------------------------------
     workout_freq = (
-        activity_data.groupby("user_id")
-        .size()
-        .reset_index(name="workouts")
+        activity_data.groupby("user_id")["workout_id"]
+        .count()
+        .reset_index()
+        .rename(columns={"workout_id": "workouts"})
     )
 
-    # ---- Retention Windows ----
-    merged_sessions = app_sessions.merge(
-        users[["user_id", "signup_date"]], on="user_id", how="left"
-    )
-    merged_sessions["diff_days"] = (merged_sessions["session_start"] - merged_sessions["signup_date"]).dt.days
+    # -----------------------------------------------------------
+    # RETENTION (D7, D14, D30)
+    # -----------------------------------------------------------
 
-    retention = merged_sessions.groupby("user_id").agg(
-        d7=("diff_days", lambda x: any((x >= 1) & (x <= 7))),
-        d14=("diff_days", lambda x: any((x >= 1) & (x <= 14))),
-        d30=("diff_days", lambda x: any((x >= 1) & (x <= 30))),
-    ).reset_index()
+    app_sessions = app_sessions[~app_sessions["session_start"].isna()].copy()
 
-    # ---- Merge base ----
-    base = (
-        users.merge(first_open, on="user_id", how="left")
-        .merge(feature_usage, on="user_id", how="left")
-        .merge(workout_freq, on="user_id", how="left")
-        .merge(retention, on="user_id", how="left")
-        .merge(subscriptions[["user_id", "plan_type"]], on="user_id", how="left")
-    )
+    def compute_ret(row):
+        uid = row["user_id"]
+        signup = row["created_at"]
+
+        sessions = app_sessions[app_sessions["user_id"] == uid]["session_start"]
+
+        d7 = any((sessions >= signup + timedelta(days=1)) &
+                 (sessions <= signup + timedelta(days=7)))
+
+        d14 = any((sessions >= signup + timedelta(days=1)) &
+                  (sessions <= signup + timedelta(days=14)))
+
+        d30 = any((sessions >= signup + timedelta(days=1)) &
+                  (sessions <= signup + timedelta(days=30)))
+
+        return pd.Series([d7, d14, d30], index=["d7", "d14", "d30"])
+
+    recent[["d7", "d14", "d30"]] = recent.apply(compute_ret, axis=1)
+
+    # Clean retention columns
+    for col in ["d7", "d14", "d30"]:
+        recent[col] = recent[col].astype(int)
+
+    # -----------------------------------------------------------
+    # MERGE ALL
+    # -----------------------------------------------------------
+    base = recent.merge(first_open, on="user_id", how="left")
+    base = base.merge(feature_usage, on="user_id", how="left")
+    base = base.merge(workout_freq, on="user_id", how="left")
+    base = base.merge(subscriptions, on="user_id", how="left")
 
     base["feature_count"] = base["feature_count"].fillna(0)
     base["workouts"] = base["workouts"].fillna(0)
 
-    # ---- Activation bucket ----
+    # -----------------------------------------------------------
+    # ACTIVATION SPEED LABEL
+    # -----------------------------------------------------------
+    def activation_label(row):
+        fo = row["first_open_date"]
+        sd = row["created_at"]
+
+        if pd.isna(fo):
+            return "Never Opened"
+        days = (fo.date() - sd.date()).days
+
+        if days == 0:
+            return "Day 0"
+        if 1 <= days <= 7:
+            return "1–7 Days"
+        if 8 <= days <= 30:
+            return "8–30 Days"
+        return "30+ Days"
+
     base["activation_speed"] = base.apply(activation_label, axis=1)
 
-    # ---- Feature bucket ----
-    def feat_bucket(x):
-        return "3+ features" if x >= 3 else "2 features" if x == 2 else "1 feature" if x == 1 else "0 features"
+    # -----------------------------------------------------------
+    # FEATURE DEPTH LABEL
+    # -----------------------------------------------------------
+    def depth_label(x):
+        if x >= 3:
+            return "3+ features"
+        if x == 2:
+            return "2 features"
+        if x == 1:
+            return "1 feature"
+        return "0 features"
 
-    base["feature_depth"] = base["feature_count"].apply(feat_bucket)
+    base["feature_depth"] = base["feature_count"].apply(depth_label)
 
-    # ---- Workout bucket ----
-    def workout_bucket(n):
-        if n >= 20: return "20+ workouts"
-        if n >= 6: return "6–19 workouts"
-        if n >= 1: return "1–5 workouts"
+    # -----------------------------------------------------------
+    # WORKOUT BUCKET
+    # -----------------------------------------------------------
+    def workout_bucket(x):
+        if x >= 20:
+            return "20+ workouts"
+        if 6 <= x <= 19:
+            return "6–19 workouts"
+        if 1 <= x <= 5:
+            return "1–5 workouts"
         return "0 workouts"
 
     base["workout_bucket"] = base["workouts"].apply(workout_bucket)
 
-    # Ensure retention columns are numeric
-    for col in ["d7", "d14", "d30"]:
-        base[col] = base[col].astype(int)
-
     return base
 
 
-# ============================================================
-# Load dataset directly from repo ZIP
-# ============================================================
-
-if not os.path.exists(ZIP_PATH):
-    st.error("❌ Dataset_problem.zip not found in repository!")
-    st.stop()
-
-users, app_events, app_sessions, activity_data, subscriptions = load_dataset(ZIP_PATH)
 base = preprocess_and_compute(users, app_events, app_sessions, activity_data, subscriptions)
 
-st.title("📊 Fitness App – RCA Dashboard")
-st.success("Dataset loaded successfully!")
+# -----------------------------------------------------------
+# 3️⃣ SEGMENTATION FUNCTION
+# -----------------------------------------------------------
+
+def compute_segment_funnel(df, segment_col):
+    seg = df.groupby(segment_col).agg(
+        signed_up=("user_id", "count"),
+        opened_app=("first_open_date", lambda x: x.notna().sum()),
+        engaged_core=("feature_count", lambda x: (x > 0).sum()),
+        d7=("d7", "sum"),
+        d14=("d14", "sum"),
+        d30=("d30", "sum"),
+    ).reset_index()
+
+    seg["pct_signup_to_open"] = round(100 * seg["opened_app"] / seg["signed_up"], 2)
+    seg["pct_open_to_engage"] = round(
+        100 * seg["engaged_core"] / seg["opened_app"].replace({0: np.nan}), 2
+    )
+    seg["pct_signup_to_engage"] = round(100 * seg["engaged_core"] / seg["signed_up"], 2)
+    seg["pct_signup_to_d7"] = round(100 * seg["d7"] / seg["signed_up"], 2)
+    seg["pct_signup_to_d14"] = round(100 * seg["d14"] / seg["signed_up"], 2)
+    seg["pct_signup_to_d30"] = round(100 * seg["d30"] / seg["signed_up"], 2)
+
+    return seg
 
 
-# ============================================================
-# SEGMENTATION VIEW
-# ============================================================
+# -----------------------------------------------------------
+# 4️⃣ STREAMLIT UI
+# -----------------------------------------------------------
 
-st.header("📌 Segmentation Explorer")
+st.title("📊 Fitness App — Root Cause Analysis Dashboard")
 
-segment_col = st.selectbox(
-    "Select Segment",
-    ["age_group", "gender", "plan_type", "activation_speed", "feature_depth", "workout_bucket"]
-)
+st.markdown("""
+This dashboard summarizes:
 
-seg = base.groupby(segment_col).agg(
-    signed_up=("user_id", "count"),
-    opened_app=("first_open_date", lambda x: x.notna().sum()),
-    engaged_core=("feature_count", lambda x: (x > 0).sum()),
-    d7=("d7", "sum"),
-    d14=("d14", "sum"),
-    d30=("d30", "sum")
-).reset_index()
+### ✅ Activation  
+### ✅ Feature Discovery  
+### ✅ Retention (D7 / D14 / D30)  
+### ✅ Segmentation (Age, Gender, Plan, Activation, Feature Depth, Workouts)  
+---
+""")
 
-# ---- Ensure numeric dtype ----
-numeric_cols = ["signed_up", "opened_app", "engaged_core", "d7", "d14", "d30"]
-seg[numeric_cols] = seg[numeric_cols].astype(float)
+# -----------------------------------------------------------
+# OVERALL SUMMARY
+# -----------------------------------------------------------
 
-# ---- Percentages ----
-seg["pct_signup_to_open"] = round(100 * seg["opened_app"] / seg["signed_up"], 2)
-seg["pct_open_to_engage"] = round(100 * seg["engaged_core"] / seg["opened_app"].replace(0, np.nan), 2)
-seg["pct_signup_to_engage"] = round(100 * seg["engaged_core"] / seg["signed_up"], 2)
-seg["pct_signup_to_d7"] = round(100 * seg["d7"] / seg["signed_up"], 2)
-seg["pct_signup_to_d14"] = round(100 * seg["d14"] / seg["signed_up"], 2)
-seg["pct_signup_to_d30"] = round(100 * seg["d30"] / seg["signed_up"], 2)
+st.header("🔍 Overall Funnel (Last 90 Days)")
 
-st.dataframe(seg)
+overall = compute_segment_funnel(base, segment_col="activation_speed")
+st.dataframe(overall)
 
-st.success("Segmentation computed successfully!")
+# -----------------------------------------------------------
+# SEGMENTED FUNNELS
+# -----------------------------------------------------------
+
+st.header("📂 Segmented Funnels")
+
+segment_options = {
+    "Activation Speed": "activation_speed",
+    "Age Group": "age_group",
+    "Gender": "gender",
+    "Plan Type": "plan_type",
+    "Feature Depth": "feature_depth",
+    "Workout Bucket": "workout_bucket",
+}
+
+choice = st.selectbox("Select a segment:", list(segment_options.keys()))
+
+seg_df = compute_segment_funnel(base, segment_options[choice])
+
+st.subheader(f"Funnel by {choice}")
+st.dataframe(seg_df)
+
+st.markdown("---")
+st.markdown("Built by Rushiraj — RCA + Cohort Analysis + Streamlit App")
